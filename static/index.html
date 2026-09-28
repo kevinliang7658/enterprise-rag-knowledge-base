@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>企业知识库RAG问答系统</title>
+<style>
+  body { font-family: "Microsoft YaHei", sans-serif; max-width: 900px; margin: 20px auto; padding: 0 16px; background: #f5f6fa; }
+  h1 { font-size: 20px; }
+  .card { background: #fff; border-radius: 8px; padding: 16px; margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+  #chat-box { height: 380px; overflow-y: auto; border: 1px solid #e0e0e0; border-radius: 6px; padding: 10px; background: #fafafa; }
+  .msg { margin: 8px 0; padding: 8px 12px; border-radius: 8px; white-space: pre-wrap; line-height: 1.6; }
+  .user { background: #d6eaff; text-align: right; }
+  .bot { background: #fff; border: 1px solid #e5e5e5; }
+  .sources { font-size: 12px; color: #888; border-top: 1px dashed #ddd; margin-top: 6px; padding-top: 4px; }
+  input[type=text] { width: 70%; padding: 8px; border: 1px solid #ccc; border-radius: 4px; }
+  button { padding: 8px 16px; border: none; border-radius: 4px; background: #2b6cb0; color: #fff; cursor: pointer; }
+  button:hover { background: #2c5282; }
+  #doc-list li { font-size: 14px; margin: 4px 0; }
+</style>
+</head>
+<body>
+<h1>企业知识库RAG问答系统（测试页面）</h1>
+
+<div class="card">
+  <b>1. 上传文档到知识库</b>（支持 pdf / docx / md / txt）<br><br>
+  <input type="file" id="file-input">
+  <button onclick="uploadDoc()">上传并入库</button>
+  <span id="upload-status"></span>
+  <ul id="doc-list"></ul>
+</div>
+
+<div class="card">
+  <b>2. 向知识库提问</b>
+  <div id="chat-box"></div>
+  <br>
+  <input type="text" id="question" placeholder="例如：年假有几天？" onkeydown="if(event.key==='Enter')ask()">
+  <button onclick="ask()">发送</button>
+  <button onclick="newSession()">新会话</button>
+</div>
+
+<script>
+let sessionId = "";  // 当前会话ID，同一页面内保持多轮记忆
+
+// 上传文档
+async function uploadDoc() {
+  const file = document.getElementById("file-input").files[0];
+  if (!file) { alert("请先选择文件"); return; }
+  const form = new FormData();
+  form.append("file", file);
+  document.getElementById("upload-status").textContent = " 处理中...";
+  const resp = await fetch("/api/documents/upload", { method: "POST", body: form });
+  const data = await resp.json();
+  document.getElementById("upload-status").textContent =
+    resp.ok ? ` 成功：切成 ${data.chunks} 块` : ` 失败：${data.detail}`;
+  loadDocs();
+}
+
+// 加载文档列表
+async function loadDocs() {
+  const resp = await fetch("/api/documents");
+  const docs = await resp.json();
+  document.getElementById("doc-list").innerHTML =
+    docs.map(d => `<li>${d.source}（${d.chunks} 个切片）</li>`).join("") || "<li>暂无文档</li>";
+}
+
+// 流式问答：用 fetch 读取 SSE 流（EventSource 不支持 POST，所以用 fetch + ReadableStream）
+async function ask() {
+  const input = document.getElementById("question");
+  const question = input.value.trim();
+  if (!question) return;
+  input.value = "";
+
+  const box = document.getElementById("chat-box");
+  box.innerHTML += `<div class="msg user">${question}</div>`;
+  const botDiv = document.createElement("div");
+  botDiv.className = "msg bot";
+  box.appendChild(botDiv);
+
+  const resp = await fetch("/api/chat", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ question, session_id: sessionId }),
+  });
+
+  // 逐块读取响应流，按 SSE 格式（data: {...}\n\n）解析
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let sources = [];
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n\n");
+    buffer = lines.pop();  // 最后一段可能不完整，留到下一轮
+    for (const line of lines) {
+      if (!line.startsWith("data: ")) continue;
+      const payload = line.slice(6);
+      if (payload === "[DONE]") break;
+      const event = JSON.parse(payload);
+      if (event.type === "session") sessionId = event.data;
+      if (event.type === "sources") sources = event.data;
+      if (event.type === "content") {
+        botDiv.textContent += event.data;  // 逐字追加，形成"打字机"效果
+        box.scrollTop = box.scrollHeight;
+      }
+      if (event.type === "error") botDiv.textContent += "\n[出错] " + event.data;
+    }
+  }
+  // 回答结束后，在下方附上引用来源
+  if (sources.length) {
+    botDiv.innerHTML += `<div class="sources">参考来源：` +
+      sources.map(s => `${s.source} 第${s.page}页（相似度${s.score}）`).join("；") + `</div>`;
+  }
+}
+
+function newSession() {
+  sessionId = "";
+  document.getElementById("chat-box").innerHTML = "";
+}
+
+loadDocs();
+</script>
+</body>
+</html>
